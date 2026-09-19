@@ -1,13 +1,21 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { useCanBusStore } from '../store/canbus';
 
 const store = useCanBusStore();
 const selectedFrameId = ref<string | null>(null);
 
+// Detail panel must stay on the same set as the filtered list: once the
+// selected frame is filtered out, drop the selection instead of keeping it
 const selectedFrame = computed(() => {
   if (!selectedFrameId.value) return null;
-  return store.frames.find(f => f.id === selectedFrameId.value) || null;
+  return store.filteredFrames.find(f => f.id === selectedFrameId.value) || null;
+});
+
+watch(() => store.filteredFrames, (list) => {
+  if (selectedFrameId.value && !list.some(f => f.id === selectedFrameId.value)) {
+    selectedFrameId.value = null;
+  }
 });
 
 function selectFrame(id: string) {
@@ -81,14 +89,91 @@ function getSignalUnit(name: string): string {
       </div>
     </div>
 
-    <!-- Search Input -->
+    <!-- Filter Bar -->
     <div class="px-4 py-2 bg-gray-800 border-b border-gray-700">
-      <input
-        v-model="store.filterText"
-        type="text"
-        placeholder="搜索 CAN ID 或信号名称..."
-        class="w-full px-3 py-1.5 bg-gray-900 border border-gray-600 rounded text-gray-100 text-sm placeholder-gray-500 focus:outline-none focus:border-cyan-500"
-      />
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div class="flex items-center gap-1.5">
+          <label class="text-xs text-gray-400 shrink-0">标识</label>
+          <input
+            v-model="store.filterId"
+            type="text"
+            placeholder="如 0x1F4"
+            class="w-24 px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs font-mono placeholder-gray-600 focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+        <div class="flex items-center gap-1.5">
+          <label class="text-xs text-gray-400 shrink-0">方向</label>
+          <select
+            v-model="store.filterDirection"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500"
+          >
+            <option value="">全部</option>
+            <option value="RX">RX</option>
+            <option value="TX">TX</option>
+          </select>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <label class="text-xs text-gray-400 shrink-0">时间段</label>
+          <input
+            v-model="store.filterTimeStart"
+            type="datetime-local"
+            step="1"
+            style="color-scheme: dark;"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500"
+          />
+          <span class="text-gray-500 text-xs">至</span>
+          <input
+            v-model="store.filterTimeEnd"
+            type="datetime-local"
+            step="1"
+            style="color-scheme: dark;"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+        <div class="flex items-center gap-1.5">
+          <label class="text-xs text-gray-400 shrink-0">信号名</label>
+          <input
+            v-model="store.filterSignal"
+            type="text"
+            placeholder="如 EngineRPM"
+            class="w-32 px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs placeholder-gray-600 focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+        <button
+          v-if="store.hasActiveFilters"
+          @click="store.clearFilters()"
+          class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-gray-200 rounded border border-gray-600 transition-colors"
+        >
+          清除筛选
+        </button>
+      </div>
+
+      <!-- Empty-result diagnosis: name the filter(s) that emptied the list -->
+      <div
+        v-if="store.frames.length > 0 && store.filteredFrames.length === 0 && store.hasActiveFilters"
+        class="mt-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700/50 rounded flex flex-wrap items-center gap-2 text-xs"
+      >
+        <span class="text-yellow-200">没有帧同时满足当前筛选条件。</span>
+        <template v-if="store.emptyFilterCulprits.length > 0">
+          <span class="text-yellow-400">导致筛空的条件:</span>
+          <button
+            v-for="culprit in store.emptyFilterCulprits"
+            :key="culprit.key"
+            @click="store.clearFilter(culprit.key)"
+            class="px-2 py-0.5 bg-yellow-800/50 hover:bg-yellow-700/60 border border-yellow-600/60 rounded text-yellow-100 transition-colors"
+            :title="`去掉${culprit.label}筛选`"
+          >
+            {{ culprit.label }} ✕
+          </button>
+        </template>
+        <span v-else class="text-yellow-400">去掉任意单个条件都无法恢复，请调整条件或清除全部筛选。</span>
+        <button
+          @click="store.clearFilters()"
+          class="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded text-gray-200 transition-colors"
+        >
+          清除全部筛选
+        </button>
+      </div>
     </div>
 
     <!-- Frame Table -->
@@ -137,7 +222,8 @@ function getSignalUnit(name: string): string {
           </tr>
           <tr v-if="store.filteredFrames.length === 0">
             <td colspan="6" class="px-3 py-8 text-center text-gray-500">
-              暂无数据 — 点击"开始捕获"以模拟接收CAN帧
+              <span v-if="store.frames.length === 0">暂无数据 — 点击"开始捕获"以模拟接收CAN帧</span>
+              <span v-else>当前筛选条件下没有匹配的帧</span>
             </td>
           </tr>
         </tbody>
