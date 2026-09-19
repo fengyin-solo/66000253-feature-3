@@ -1,18 +1,185 @@
 import { defineStore } from 'pinia';
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import type { CanFrame, DbcMessage, BusStats } from '../types';
 import { parseDbc, decodeCanFrame, DEFAULT_DBC_CONTENT } from '../utils/dbc-parser';
 
 let frameIdCounter = 0;
 
+export type FilterDirection = '' | 'RX' | 'TX';
+export type FilterKey = 'id' | 'direction' | 'timeRange' | 'signal';
+
+const FILTER_STORAGE_KEY = 'canbus-filters';
+
+interface PersistedFilters {
+  filterId: string;
+  filterDirection: FilterDirection;
+  filterStartTime: string;
+  filterEndTime: string;
+  filterSignal: string;
+}
+
+function loadPersistedFilters(): PersistedFilters {
+  const defaults: PersistedFilters = {
+    filterId: '',
+    filterDirection: '',
+    filterStartTime: '',
+    filterEndTime: '',
+    filterSignal: ''
+  };
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw) as Partial<PersistedFilters>;
+    return {
+      filterId: typeof parsed.filterId === 'string' ? parsed.filterId : '',
+      filterDirection:
+        parsed.filterDirection === 'RX' || parsed.filterDirection === 'TX'
+          ? parsed.filterDirection
+          : '',
+      filterStartTime: typeof parsed.filterStartTime === 'string' ? parsed.filterStartTime : '',
+      filterEndTime: typeof parsed.filterEndTime === 'string' ? parsed.filterEndTime : '',
+      filterSignal: typeof parsed.filterSignal === 'string' ? parsed.filterSignal : ''
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+/** datetime-local input value ("YYYY-MM-DDTHH:mm:ss") to epoch ms; NaN when empty/invalid */
+function parseDateTimeInput(value: string): number {
+  if (!value) return NaN;
+  return new Date(value).getTime();
+}
+
 export const useCanBusStore = defineStore('canbus', () => {
   const frames = ref<CanFrame[]>([]);
   const signals = ref<Map<string, { name: string; data: { time: number; value: number }[] }>>(new Map());
   const dbcMessages = ref<Map<number, DbcMessage>>(new Map());
-  const filterId = ref('');
-  const filterText = ref('');
+
+  const persisted = loadPersistedFilters();
+  const filterId = ref(persisted.filterId);
+  const filterDirection = ref<FilterDirection>(persisted.filterDirection);
+  const filterStartTime = ref(persisted.filterStartTime);
+  const filterEndTime = ref(persisted.filterEndTime);
+  const filterSignal = ref(persisted.filterSignal);
+
   const isCapturing = ref(false);
   const pollInterval = ref<number | null>(null);
+
+  // Persist filters so they survive a page refresh
+  watch(
+    [filterId, filterDirection, filterStartTime, filterEndTime, filterSignal],
+    () => {
+      const snapshot: PersistedFilters = {
+        filterId: filterId.value,
+        filterDirection: filterDirection.value,
+        filterStartTime: filterStartTime.value,
+        filterEndTime: filterEndTime.value,
+        filterSignal: filterSignal.value
+      };
+      try {
+        localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(snapshot));
+      } catch {
+        // Ignore storage failures (private mode / quota) — filters still work in-session
+      }
+    },
+    { deep: true }
+  );
+
+  function matchesIdFilter(frame: CanFrame): boolean {
+    const keyword = filterId.value.trim().toLowerCase().replace(/^0x/, '');
+    if (!keyword) return true;
+    return frame.arbitrationId.toString(16).toLowerCase().includes(keyword);
+  }
+
+  function matchesDirectionFilter(frame: CanFrame): boolean {
+    if (!filterDirection.value) return true;
+    return frame.direction === filterDirection.value;
+  }
+
+  function matchesTimeRangeFilter(frame: CanFrame): boolean {
+    const start = parseDateTimeInput(filterStartTime.value);
+    const end = parseDateTimeInput(filterEndTime.value);
+    // An inverted range matches nothing
+    if (!Number.isNaN(start) && !Number.isNaN(end) && start > end) return false;
+    if (!Number.isNaN(start) && frame.timestamp < start) return false;
+    if (!Number.isNaN(end) && frame.timestamp > end) return false;
+    return true;
+  }
+
+  function matchesSignalFilter(frame: CanFrame): boolean {
+    const keyword = filterSignal.value.trim().toLowerCase();
+    if (!keyword) return true;
+    return Object.keys(frame.decoded).some(key => key.toLowerCase().includes(keyword));
+  }
+
+  const filterPredicates: { key: FilterKey; active: () => boolean; test: (f: CanFrame) => boolean }[] = [
+    { key: 'id', active: () => filterId.value.trim() !== '', test: matchesIdFilter },
+    { key: 'direction', active: () => filterDirection.value !== '', test: matchesDirectionFilter },
+    {
+      key: 'timeRange',
+      active: () => filterStartTime.value !== '' || filterEndTime.value !== '',
+      test: matchesTimeRangeFilter
+    },
+    {
+      key: 'signal',
+      active: () => filterSignal.value.trim() !== '',
+      test: matchesSignalFilter
+    }
+  ];
+
+  // Active filters AND together: a frame is kept only when every active filter matches
+  const filteredFrames = computed(() => {
+    const activePredicates = filterPredicates.filter(p => p.active());
+    if (activePredicates.length === 0) return frames.value;
+    return frames.value.filter(frame => activePredicates.every(p => p.test(frame)));
+  });
+
+  const activeFilters = computed<FilterKey[]>(() =>
+    filterPredicates.filter(p => p.active()).map(p => p.key)
+  );
+
+  // Match count of each active filter applied alone (against the full set)
+  const filterMatchCounts = computed<Record<FilterKey, number>>(() => {
+    const counts: Record<FilterKey, number> = {
+      id: -1,
+      direction: -1,
+      timeRange: -1,
+      signal: -1
+    };
+    for (const p of filterPredicates) {
+      if (p.active()) {
+        counts[p.key] = frames.value.filter(frame => p.test(frame)).length;
+      }
+    }
+    return counts;
+  });
+
+  // When the combined result is empty, every active filter matching nothing on its
+  // own is responsible for emptying the result
+  const emptyCulprits = computed<FilterKey[]>(() => {
+    if (filteredFrames.value.length > 0 || frames.value.length === 0) return [];
+    return filterPredicates
+      .filter(p => p.active() && filterMatchCounts.value[p.key] === 0)
+      .map(p => p.key);
+  });
+
+  function clearFilter(key: FilterKey) {
+    if (key === 'id') filterId.value = '';
+    else if (key === 'direction') filterDirection.value = '';
+    else if (key === 'timeRange') {
+      filterStartTime.value = '';
+      filterEndTime.value = '';
+    } else if (key === 'signal') filterSignal.value = '';
+  }
+
+  function clearAllFilters() {
+    filterId.value = '';
+    filterDirection.value = '';
+    filterStartTime.value = '';
+    filterEndTime.value = '';
+    filterSignal.value = '';
+  }
 
   const busStats = ref<BusStats>({
     totalFrames: 0,
@@ -21,31 +188,6 @@ export const useCanBusStore = defineStore('canbus', () => {
     errorCount: 0,
     busLoad: 0,
     lastUpdate: Date.now()
-  });
-
-  const filteredFrames = computed(() => {
-    let result = frames.value;
-
-    if (filterId.value.trim()) {
-      const idFilter = filterId.value.trim().toLowerCase().replace(/^0x/, '');
-      result = result.filter(f =>
-        f.arbitrationId.toString(16).toLowerCase().includes(idFilter)
-      );
-    }
-
-    if (filterText.value.trim()) {
-      const textFilter = filterText.value.trim().toLowerCase();
-      result = result.filter(f => {
-        if (f.arbitrationId.toString(16).toLowerCase().includes(textFilter)) return true;
-        if (f.data.toLowerCase().includes(textFilter)) return true;
-        for (const key of Object.keys(f.decoded)) {
-          if (key.toLowerCase().includes(textFilter)) return true;
-        }
-        return false;
-      });
-    }
-
-    return result;
   });
 
   const busLoadPercent = computed(() => {
@@ -201,11 +343,19 @@ export const useCanBusStore = defineStore('canbus', () => {
     signals,
     dbcMessages,
     filterId,
-    filterText,
+    filterDirection,
+    filterStartTime,
+    filterEndTime,
+    filterSignal,
     busStats,
     isCapturing,
     filteredFrames,
+    activeFilters,
+    filterMatchCounts,
+    emptyCulprits,
     busLoadPercent,
+    clearFilter,
+    clearAllFilters,
     addFrame,
     clearFrames,
     loadMockDbc,

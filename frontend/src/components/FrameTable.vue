@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { useCanBusStore } from '../store/canbus';
+import type { FilterKey } from '../store/canbus';
 
 const store = useCanBusStore();
 const selectedFrameId = ref<string | null>(null);
@@ -9,6 +10,54 @@ const selectedFrame = computed(() => {
   if (!selectedFrameId.value) return null;
   return store.frames.find(f => f.id === selectedFrameId.value) || null;
 });
+
+// The detail panel must always describe a frame that belongs to the same set
+// shown in the table: when filters change (or the frame ages out), drop the
+// selection instead of lingering on a frame that is no longer visible.
+watch(
+  () => store.filteredFrames.map(f => f.id).join(','),
+  () => {
+    if (selectedFrameId.value && !store.filteredFrames.some(f => f.id === selectedFrameId.value)) {
+      selectedFrameId.value = null;
+    }
+  }
+);
+
+// Known decoded signal names, offered as quick-pick suggestions
+const signalNameOptions = computed(() => {
+  const names = new Set<string>();
+  for (const frame of store.frames) {
+    for (const key of Object.keys(frame.decoded)) names.add(key);
+  }
+  return Array.from(names).sort();
+});
+
+const FILTER_LABELS: Record<FilterKey, string> = {
+  id: '标识',
+  direction: '收发方向',
+  timeRange: '时间段',
+  signal: '信号名'
+};
+
+// Human-readable description of an active filter, shown when it empties the list
+function describeFilter(key: FilterKey): string {
+  if (key === 'id') {
+    return `标识含 “${store.filterId.trim()}”`;
+  }
+  if (key === 'direction') {
+    return `方向为 ${store.filterDirection}`;
+  }
+  if (key === 'timeRange') {
+    const parts: string[] = [];
+    if (store.filterStartTime) parts.push(`从 ${store.filterStartTime.replace('T', ' ')}`);
+    if (store.filterEndTime) parts.push(`到 ${store.filterEndTime.replace('T', ' ')}`);
+    return `时间段（${parts.join(' ')}）`;
+  }
+  return `信号名含 “${store.filterSignal.trim()}”`;
+}
+
+const hasFrames = computed(() => store.frames.length > 0);
+const activeFilterCount = computed(() => store.activeFilters.length);
 
 function selectFrame(id: string) {
   selectedFrameId.value = selectedFrameId.value === id ? null : id;
@@ -81,14 +130,114 @@ function getSignalUnit(name: string): string {
       </div>
     </div>
 
-    <!-- Search Input -->
+    <!-- Filters: 标识 / 收发方向 / 时间段 / 信号名 (AND-combined) -->
     <div class="px-4 py-2 bg-gray-800 border-b border-gray-700">
-      <input
-        v-model="store.filterText"
-        type="text"
-        placeholder="搜索 CAN ID 或信号名称..."
-        class="w-full px-3 py-1.5 bg-gray-900 border border-gray-600 rounded text-gray-100 text-sm placeholder-gray-500 focus:outline-none focus:border-cyan-500"
-      />
+      <div class="flex flex-wrap items-center gap-2">
+        <!-- 标识 -->
+        <div class="flex items-center gap-1">
+          <label class="text-xs text-gray-400 whitespace-nowrap">标识</label>
+          <input
+            v-model="store.filterId"
+            type="text"
+            placeholder="如 7DF"
+            class="w-28 px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs placeholder-gray-500 focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+
+        <!-- 收发方向 -->
+        <div class="flex items-center gap-1">
+          <label class="text-xs text-gray-400 whitespace-nowrap">方向</label>
+          <select
+            v-model="store.filterDirection"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500"
+          >
+            <option value="">全部</option>
+            <option value="RX">RX</option>
+            <option value="TX">TX</option>
+          </select>
+        </div>
+
+        <!-- 时间段 -->
+        <div class="flex items-center gap-1">
+          <label class="text-xs text-gray-400 whitespace-nowrap">时间</label>
+          <input
+            v-model="store.filterStartTime"
+            type="datetime-local"
+            step="1"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500 [color-scheme:dark]"
+          />
+          <span class="text-gray-500 text-xs">~</span>
+          <input
+            v-model="store.filterEndTime"
+            type="datetime-local"
+            step="1"
+            class="px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs focus:outline-none focus:border-cyan-500 [color-scheme:dark]"
+          />
+        </div>
+
+        <!-- 信号名 -->
+        <div class="flex items-center gap-1">
+          <label class="text-xs text-gray-400 whitespace-nowrap">信号名</label>
+          <input
+            v-model="store.filterSignal"
+            type="text"
+            list="signal-name-suggestions"
+            placeholder="如 EngineRPM"
+            class="w-36 px-2 py-1 bg-gray-900 border border-gray-600 rounded text-gray-100 text-xs placeholder-gray-500 focus:outline-none focus:border-cyan-500"
+          />
+          <datalist id="signal-name-suggestions">
+            <option v-for="name in signalNameOptions" :key="name" :value="name" />
+          </datalist>
+        </div>
+
+        <button
+          v-if="activeFilterCount > 0"
+          @click="store.clearAllFilters()"
+          class="ml-auto px-2 py-1 text-xs text-gray-300 bg-gray-700 hover:bg-gray-600 rounded border border-gray-600 transition-colors whitespace-nowrap"
+        >
+          清除全部筛选 ({{ activeFilterCount }})
+        </button>
+      </div>
+    </div>
+
+    <!-- Empty result: identify which filter(s) emptied the set -->
+    <div
+      v-if="hasFrames && store.filteredFrames.length === 0"
+      class="px-4 py-2 bg-red-950/40 border-b border-red-900/60 text-xs"
+    >
+      <template v-if="store.emptyCulprits.length > 0">
+        <span class="text-red-300">
+          没有帧满足当前筛选 —
+          {{ store.emptyCulprits.length === 1 ? '该筛选' : '以下筛选' }}单独已匹配 0 帧：
+        </span>
+        <span class="inline-flex flex-wrap gap-1.5 mt-1">
+          <span
+            v-for="key in store.emptyCulprits"
+            :key="key"
+            class="inline-flex items-center gap-1 bg-red-900/50 border border-red-800 rounded px-1.5 py-0.5"
+          >
+            <span class="text-red-200">{{ describeFilter(key) }}</span>
+            <button
+              @click="store.clearFilter(key)"
+              :title="`去掉${FILTER_LABELS[key]}筛选`"
+              class="text-red-300 hover:text-white font-bold leading-none"
+            >
+              ✕
+            </button>
+          </span>
+        </span>
+      </template>
+      <template v-else>
+        <span class="text-amber-300">
+          没有帧同时满足全部 {{ activeFilterCount }} 个筛选（单个筛选均有匹配，但叠加后交集为空）。
+        </span>
+        <button
+          @click="store.clearAllFilters()"
+          class="ml-2 text-cyan-400 hover:text-cyan-300 underline"
+        >
+          清除全部筛选
+        </button>
+      </template>
     </div>
 
     <!-- Frame Table -->
@@ -137,7 +286,12 @@ function getSignalUnit(name: string): string {
           </tr>
           <tr v-if="store.filteredFrames.length === 0">
             <td colspan="6" class="px-3 py-8 text-center text-gray-500">
-              暂无数据 — 点击"开始捕获"以模拟接收CAN帧
+              <template v-if="!hasFrames">
+                暂无数据 — 点击"开始捕获"以模拟接收CAN帧
+              </template>
+              <template v-else>
+                当前筛选条件下没有匹配的帧
+              </template>
             </td>
           </tr>
         </tbody>

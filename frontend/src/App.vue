@@ -90,7 +90,15 @@ function handleExport() {
         <span>DBC消息: {{ store.dbcMessages.size }}</span>
       </div>
       <div class="flex items-center gap-4 text-gray-500">
-        <span>帧数: {{ store.busStats.totalFrames }}</span>
+        <span>
+          帧数:
+          <span :class="store.activeFilters.length > 0 ? 'text-cyan-400 font-bold' : ''">
+            {{ store.filteredFrames.length }}
+          </span>
+          <span v-if="store.activeFilters.length > 0" class="text-gray-500">
+            / 共 {{ store.frames.length }}
+          </span>
+        </span>
         <span>RX: {{ store.busStats.rxCount }}</span>
         <span>TX: {{ store.busStats.txCount }}</span>
         <span>负载: {{ store.busLoadPercent }}%</span>
